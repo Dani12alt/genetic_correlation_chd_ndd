@@ -1,0 +1,586 @@
+---
+title: "LAVA
+author: "daniel_linares"
+output: html_document
+---
+
+# Set up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+shell_call <- function(command, ...) {
+  result <- system(command, intern = TRUE, ...)
+  cat(paste0(result, collapse = "\n"))
+}
+```
+
+
+```{r}
+install.packages("R.utils")
+library(data.table)
+library(tidyverse)
+
+if (!require("BiocManager", quietly=T)) install.packages("BiocManager")
+BiocManager::install("snpStats")
+
+if (!require("remotes", quietly=T)) install.packages("remotes")
+remotes::install_github("josefin-werme/LAVA")
+
+library(LAVA)
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("GenomicRanges")
+
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load_gh("trinker/qdapTools")
+
+BiocManager::install("BiocGenerics", force = TRUE)
+
+BiocManager::install("GenomeInfoDb", force = TRUE)
+
+
+library(GenomicRanges)
+library(qdapTools)
+
+BiocManager::install("rtracklayer")
+
+library(rtracklayer)
+```
+
+
+# Import GWAS
+
+## Import Meta-analysis of Septal Defects
+
+```{r}
+chd_finngen <-
+  fread("/content/METAANALYSIS1_Septal.TBL")
+```
+
+```{r}
+chd_finngen[, N := 451549 + 2184 + 458440]
+```
+
+```{r}
+chd_finngen <- chd_finngen %>%
+  select(SNP = MarkerName, A1 = Allele1, A2 = Allele2, N, B = Effect, SE = "StdErr", P = "P-value")
+```
+
+```{r}
+chd_finngen[, A1 := toupper(A1)]
+chd_finngen[, A2 := toupper(A2)]
+```
+
+```{r}
+chd_finngen[, Z := B / SE]
+```
+
+```{r}
+bim <- fread("/content/g1000_eur/g1000_eur.bim", col.names = c("CHR", "SNP", "CM", "BP", "A1", "A2"))
+```
+
+```{r}
+chd_finngen <- left_join(chd_finngen, bim[, .(SNP, BP, CHR)], by = "SNP")
+```
+
+```{r}
+fwrite(chd_finngen,
+  file =
+    "chd_summaries.lava.gz",
+  sep = "\t"
+)
+```
+
+```{r}
+remove(chd_finngen)
+```
+
+```{r}
+remove(bim)
+```
+
+## Import ASD GWAS from PGC
+
+```{r}
+shell_call('wget --user-agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0" -O asdPGC.zip "https://figshare.com/ndownloader/articles/14671989/versions/1"')
+```
+
+```{r}
+shell_call("unzip /content/asdPGC.zip")
+```
+
+```{r}
+pgc_asd <- fread("/content/iPSYCH-PGC_ASD_Nov2017.gz")
+```
+
+```{r}
+pgc_asd[, N := 18382 + 27969]
+pgc_asd[, B := log(OR)]
+pgc_asd[, Z := B / SE]
+```
+
+```{r}
+#invert A1 and A2
+pgc_asd <- pgc_asd %>%
+  select(SNP, CHR, A1, A2, N, Z, B, P, SE, BP) %>%
+  mutate(
+    tmp = A1,   # temporary copy
+    A1 = A2,
+    A2 = tmp
+  ) %>%
+  select(-tmp)
+```
+
+```{r}
+fwrite(pgc_asd,
+  file =
+    "asd_summaries.lava.gz",
+  sep = "\t"
+)
+```
+
+```{r}
+remove(pgc_asd)
+```
+
+# Run LAVA
+
+## ASD - Septal
+
+### Setting
+
+```{r}
+studies_CHD_autism <- data.table(
+    phenotype = c('CHD', 'ASD'),
+    cases = c(2184+687, 18382),
+    controls = c(451549+457753, 27969),
+    filename = c('/content/chd_summaries.lava.gz', "/content/asd_summaries.lava.gz")
+)
+```
+
+```{r}
+fwrite(
+    studies_CHD_autism,
+    "/content/phenotypes_prevalence_CHDasd.LAVA.txt",
+    sep = '\t',
+    na = "NA",
+    quote = F
+)
+```
+
+```{r}
+# Get the LAVA Blocks
+
+system("git clone https://github.com/cadeleeuw/lava-partitioning.git")
+```
+
+### Select Loci Blocks
+
+```{r}
+ld_blocks <- fread("/content/lava-partitioning/LAVA_s2500_m25_f1_w200.blocks")
+```
+
+```{r}
+shell_call("wget ftp://ftp.ensembl.org/pub/grch37/release-87/gtf/homo_sapiens/Homo_sapiens.GRCh37.87.gtf.gz")
+```
+
+```{r}
+shell_call("gunzip Homo_sapiens.GRCh37.87.gtf.gz")
+```
+
+```{r}
+gwas_list <-
+  setNames(
+    object = list(
+      fread("/content/asd_summaries.lava.gz"),
+      fread("/content/chd_summaries.lava.gz")
+    ),
+    nm = c("CHD", "ASD")
+  )
+```
+
+```{r}
+ref <- import("/content/Homo_sapiens.GRCh37.87.gtf")
+ref <- ref %>% keepSeqlevels(c(1:22), pruning.mode = "coarse")
+ref <- ref[ref$type == "gene"]
+```
+
+```{r}
+colnames(gwas_list[[2]])
+```
+
+```{r}
+# Filter for only genome-wide significant loci and convert to granges
+gr_list <-
+  gwas_list %>%
+  lapply(., function(gwas){
+    gwas %>%
+      dplyr::filter(P < 5e-8) %>%
+      GenomicRanges::makeGRangesFromDataFrame(
+        .,
+        keep.extra.columns = TRUE,
+        ignore.strand = TRUE,
+        seqinfo = NULL,
+        seqnames.field = "CHR",
+        start.field = "BP",
+        end.field = "BP",
+        na.rm=TRUE
+      )
+  })
+```
+
+```{r}
+ld_blocks <-
+  ld_blocks %>%
+  dplyr::rename_with(
+    .fn = stringr::str_to_upper,
+    .cols = everything()
+  ) %>%
+  dplyr::mutate(
+    LOC = dplyr::row_number()
+  ) %>%
+  dplyr::select(LOC, everything())
+```
+
+```{r}
+ld_blocks_gr <-
+  ld_blocks %>%
+  GenomicRanges::makeGRangesFromDataFrame(
+    .,
+    keep.extra.columns = TRUE,
+    ignore.strand = TRUE,
+    seqinfo = NULL,
+    seqnames.field = "chr",
+    start.field = "start",
+    end.field = "stop"
+  )
+```
+
+```{r}
+overlap_list <-
+  gr_list %>%
+  lapply(., function(gr){
+    GenomicRanges::findOverlaps(gr, ld_blocks_gr, type = "within") %>%
+      as_tibble()
+  })
+```
+
+```{r}
+loci <-
+  ld_blocks %>%
+  dplyr::slice(
+    overlap_list %>%
+      qdapTools::list_df2df(col1 = "gwas") %>%
+      .[["subjectHits"]] %>%
+      unique()
+    ) %>%
+  dplyr::arrange(LOC)
+```
+
+```{r}
+# Generate df of GWAS loci that overlap which LD blocks
+overlap_df_list <- vector(mode = "list", length = length(gr_list))
+
+for(i in 1:length(gr_list)){
+
+  gr <- gr_list[[i]]
+
+  names(overlap_df_list)[i] <- names(gr_list)[i]
+
+  if(names(gr_list)[i] == c("mdd")){
+
+    overlap_df_list[[i]] <-
+      gr %>%
+      as_tibble() %>%
+      dplyr::mutate(
+        BETA = NA,
+        OR = NA
+      ) %>%
+      dplyr::select(seqnames, start, end, SNP, SNP, A1, A2, B, Z, P, N, SE)
+
+
+  } else if(names(gr_list)[i] == c("scz")){
+
+    overlap_df_list[[i]] <-
+      gr %>%
+      as_tibble() %>%
+      dplyr::mutate(
+        BETA = NA,
+        logOdds = NA
+      ) %>%
+      dplyr::select(seqnames, start, end, SNP, A1, A2, B, Z, P, N, SE)
+
+  } else{
+
+    overlap_df_list[[i]] <-
+      gr %>%
+      as_tibble() %>%
+      dplyr::mutate(
+        OR = NA,
+        logOdds = NA
+      ) %>%
+      dplyr::select(seqnames, start, end, SNP, A1, A2, B, Z, P, N, SE)
+ # 'SNP''CHR''A1''A2''N''Z''B''P''BP'; Add SE?
+  }
+
+  overlap_df_list[[i]] <-
+    overlap_df_list[[i]] %>%
+    dplyr::rename_with(
+      ~ stringr::str_c("GWAS", .x, sep = "_")
+    ) %>%
+    dplyr::slice(overlap_list[[i]]$queryHits) %>%
+    dplyr::bind_cols(
+      ld_blocks_gr %>%
+        as_tibble() %>%
+        dplyr::rename_with(
+          ~ stringr::str_c("LD", .x, sep = "_")
+        ) %>%
+        dplyr::slice(overlap_list[[i]]$subjectHits)
+    ) %>%
+    dplyr::select(-contains("strand")) %>%
+    dplyr::rename_with(
+      ~ stringr::str_replace(.x,
+                             pattern = "seqnames",
+                             replacement = "CHR"),
+      .col = dplyr::ends_with("seqnames"))
+
+}
+
+overlap_df <-
+  overlap_df_list %>%
+  qdapTools::list_df2df(col1= "GWAS")
+```
+
+```{r}
+# Generate df of associated GWAS and genes that overlap investigated LD blocks
+loci_gr <-
+  loci %>%
+  GenomicRanges::makeGRangesFromDataFrame(
+    .,
+    keep.extra.columns = TRUE,
+    ignore.strand = TRUE,
+    seqinfo = NULL,
+    seqnames.field = "CHR",
+    start.field = "START",
+    end.field = "STOP"
+  )
+
+overlap <-
+  GenomicRanges::findOverlaps(loci_gr, ref) %>%
+  tibble::as_tibble()
+
+loci_genes <-
+  tibble::tibble(
+    locus = loci_gr[overlap$queryHits]$LOC,
+    chr = loci_gr[overlap$queryHits] %>% GenomeInfoDb::seqnames() %>% as.character(),
+    locus_start = loci_gr[overlap$queryHits] %>% BiocGenerics::start(),
+    locus_end = loci_gr[overlap$queryHits] %>% BiocGenerics::end(),
+    gene_id = ref[overlap$subjectHits]$gene_id,
+    gene_name =
+      ref[overlap$subjectHits]$gene_name %>%
+      stringr::str_replace_all("-", "_") %>%
+      stringr::str_replace_all("\\.", "_")
+  ) %>%
+  dplyr::group_by(locus, chr, locus_start, locus_end) %>%
+  dplyr::summarise(
+    n_overlapping_genes = n(),
+    overlapping_gene_id = list(gene_id),
+    overlapping_gene_name = list(gene_name)
+      )
+
+loci_genes_gwas_df <-
+  loci_genes %>%
+  dplyr::inner_join(
+    overlap_df %>%
+      dplyr::distinct(GWAS, LD_LOC) %>%
+      dplyr::group_by(LD_LOC) %>%
+      dplyr::summarise(
+        n_assoc_gwas = n(),
+        assoc_gwas = list(str_to_upper(GWAS))
+        ),
+    by = c("locus" = "LD_LOC")
+  )
+```
+
+```{r}
+system("mkdir /content/filtered_loci")
+
+```
+
+```{r}
+out_dir <- "filtered_loci"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+write_delim(
+  loci,
+  delim = "\t",
+  file = file.path(out_dir, "gwas_filtered.loci")
+  )
+saveRDS(
+  overlap_df,
+  file = file.path(out_dir, "gwas_filtered_loci.rds")
+  )
+saveRDS(
+  loci_genes_gwas_df,
+  file = file.path(out_dir, "gwas_filtered_loci_w_genes.rds")
+)
+```
+
+```{r}
+remove(gwas_list)
+```
+
+### GET LAD Reference panel
+
+```{r}
+shell_call('wget -O g1000_eur.zip "https://vu.data.surfsara.nl/index.php/s/VZNByNwpD8qqINe/download"')
+```
+
+```{r}
+shell_call("unzip -o /content/g1000_eur.zip -d /content/g1000_eur/")
+```
+
+### Process input file
+
+```{r}
+input = process.input(input.info.file="/content/phenotypes_prevalence_CHDasd.LAVA.txt",           # input info file
+                      sample.overlap.file=NULL,   # sample overlap file (can be set to NULL if there is no overlap)
+                      ref.prefix="/content/g1000_eur/g1000_eur",                    # reference genotype data prefix
+                      phenos=c('CHD', 'ASD'))       # subset of phenotypes listed in the input info file that we want to process
+
+```
+
+```{r}
+# inspect the processed input data
+ls(input)                     # this is actually an environment; hence ls() rather than str()
+ls(input$sum.stats)   # processed summary statistics
+head(input$sum.stats$bmi)
+input$info            # processed input info file, with additional variables computed by process.input()
+input$sample.overlap  # sample overlap file
+
+
+head(input$ref$bim)   # bim file from reference data
+```
+
+```{r}
+loci <- LAVA::read.loci("/content/filtered_loci/gwas_filtered.loci")
+n_loci <- nrow(loci)
+```
+
+### Run LAVA analysis
+
+```{r}
+progress <-
+  quantile(
+    x = 1:n_loci,
+    probs = seq(.05,1,.05)
+    ) %>%
+  ceiling()
+```
+
+```{r}
+univar_threshold <-
+  0.05/n_loci
+```
+
+```{r}
+univar = bivar = list()
+```
+
+```{r}
+for (i in 1:n_loci) {
+
+  if (i %in% progress) print(str_c("..", names(progress[which(progress==i)])))     # (printing progress)
+
+  # Process locus
+  locus <-
+    LAVA::process.locus(
+      loci[i,],
+      input
+      )
+
+  # It is possible that the locus cannot be defined for various reasons (e.g. too few SNPs),
+  # The !is.null(locus) check is necessary before calling the analysis functions.
+  if (!is.null(locus)) {
+
+    # extract some general locus info for the output
+    loc_info <-
+      data.frame(
+        locus = locus$id,
+        chr = locus$chr,
+        start = locus$start,
+        stop = locus$stop,
+        n_snps = locus$n.snps,
+        n_pcs = locus$K
+        )
+
+    # Run the univariate and bivariate tests
+    loc_out <-
+      LAVA::run.univ.bivar(
+        locus,
+        univ.thresh = univar_threshold
+      )
+
+    # Bind
+    univar[[i]] <-
+      loc_info %>%
+      dplyr::bind_cols(loc_out$univ)
+
+    if(!is.null(loc_out$bivar)){
+
+      bivar[[i]] <-
+        loc_info %>%
+        dplyr::bind_cols(loc_out$bivar)
+
+      }
+
+    }
+
+  }
+
+```
+
+```{r}
+system("mkdir /content/results")
+```
+
+```{r}
+phenotypes <- c("CHD", "ASD")
+```
+
+```{r}
+out_dir <- "/content/results"
+#dir.create(out_dir, showWarnings = T)
+saveRDS(
+  univar,
+  file = file.path(out_dir, str_c(str_c(phenotypes, collapse = ":"), ".univ.lava.rds"))
+)
+saveRDS(
+  bivar,
+  file = file.path(out_dir, str_c(str_c(phenotypes, collapse = ":"), ".bivar.lava.rds"))
+)
+```
+
+```{r}
+bivar_df <- bivar %>%
+  compact() %>%       # Remove NULLs
+  bind_rows()
+```
+
+```{r}
+univar_df <- univar %>%
+  compact() %>%       # Remove NULLs
+  bind_rows()
+```
+
+```{r}
+write.csv(univar_df, "results/univar_df.csv")
+```
+
+```{r}
+write.csv(univar_df, "results/bivar_df.csv")
+```
+
